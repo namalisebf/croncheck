@@ -1,81 +1,63 @@
-"""Notifier ties the registry to alert backends."""
+"""Notifier: checks registry for overdue/failed jobs and dispatches alerts."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import Optional, Set
 
-if TYPE_CHECKING:
-    from croncheck.alerts import AlertBackend
-    from croncheck.registry import JobRegistry
+from croncheck.alerts import AlertBackend
+from croncheck.registry import JobRegistry
+from croncheck.throttle import AlertThrottle
 
 logger = logging.getLogger(__name__)
 
-_MISSED_SUBJECT = "[croncheck] Missed run: {job_id}"
-_MISSED_BODY = (
-    "Job '{job_id}' was expected at {expected_at} (grace {grace}s) "
-    "but has not checked in.\nSchedule: {schedule}"
-)
 
-_FAILED_SUBJECT = "[croncheck] Failed run: {job_id}"
-_FAILED_BODY = (
-    "Job '{job_id}' reported a failure at {checkin_time}.\n"
-    "Exit code: {exit_code}\nOutput:\n{output}"
-)
-
-
-@dataclass
 class Notifier:
-    """Checks the registry for overdue jobs and dispatches alerts."""
+    """Polls a JobRegistry and sends alerts via an AlertBackend."""
 
-    registry: JobRegistry
-    backend: AlertBackend
-    _alerted: set[str] = field(default_factory=set, init=False)
-
-    def check_and_notify(self) -> list[str]:
-        """Scan all jobs; send alerts for newly overdue ones. Returns alerted job IDs."""
-        now = datetime.now(tz=timezone.utc)
-        newly_alerted: list[str] = []
-
-        for job in self.registry.all_jobs():
-            if not job.is_overdue(now):
-                # Clear alert state so we re-alert next time it goes overdue
-                self._alerted.discard(job.job_id)
-                continue
-
-            if job.job_id in self._alerted:
-                continue
-
-            expected = job.expected_at(now)
-            subject = _MISSED_SUBJECT.format(job_id=job.job_id)
-            body = _MISSED_BODY.format(
-                job_id=job.job_id,
-                expected_at=expected.isoformat() if expected else "unknown",
-                grace=job.grace_seconds,
-                schedule=job.schedule,
-            )
-            self.backend.send(subject, body)
-            self._alerted.add(job.job_id)
-            newly_alerted.append(job.job_id)
-            logger.warning("Alert sent for overdue job '%s'", job.job_id)
-
-        return newly_alerted
-
-    def notify_failure(
+    def __init__(
         self,
-        job_id: str,
-        exit_code: int,
-        output: str = "",
+        registry: JobRegistry,
+        backend: AlertBackend,
+        throttle: Optional[AlertThrottle] = None,
     ) -> None:
-        """Send an immediate failure alert for a job that reported an error."""
-        subject = _FAILED_SUBJECT.format(job_id=job_id)
-        body = _FAILED_BODY.format(
-            job_id=job_id,
-            checkin_time=datetime.now(tz=timezone.utc).isoformat(),
-            exit_code=exit_code,
-            output=output or "(no output)",
-        )
-        self.backend.send(subject, body)
-        logger.warning("Failure alert sent for job '%s' (exit %d)", job_id, exit_code)
+        self.registry = registry
+        self.backend = backend
+        self.throttle: AlertThrottle = throttle or AlertThrottle()
+        self._alerted: Set[str] = set()
+
+    def check_and_notify(self) -> None:
+        """Inspect all registered jobs; alert for any that are overdue."""
+        for name, job in self.registry.jobs.items():
+            if self.registry.is_overdue(name):
+                if self.throttle.should_alert(name):
+                    self.backend.send(
+                        subject=f"[croncheck] Job overdue: {name}",
+                        body=(
+                            f"Job '{name}' has not checked in within its "
+                            f"schedule + grace period ({job.grace_seconds}s)."
+                        ),
+                    )
+                    self._alerted.add(name)
+                    logger.warning("Alert sent for overdue job '%s'.", name)
+                else:
+                    logger.debug("Alert for '%s' suppressed by throttle.", name)
+            else:
+                if name in self._alerted:
+                    logger.info("Job '%s' recovered; resetting throttle.", name)
+                    self.throttle.reset(name)
+                    self._alerted.discard(name)
+
+    def notify_failure(self, job_name: str, reason: str) -> None:
+        """Immediately send a failure alert, subject to throttle."""
+        if self.throttle.should_alert(job_name):
+            self.backend.send(
+                subject=f"[croncheck] Job failed: {job_name}",
+                body=f"Job '{job_name}' reported a failure: {reason}",
+            )
+            self._alerted.add(job_name)
+            logger.warning("Failure alert sent for job '%s': %s", job_name, reason)
+        else:
+            logger.debug(
+                "Failure alert for '%s' suppressed by throttle.", job_name
+            )
