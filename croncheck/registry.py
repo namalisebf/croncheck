@@ -1,58 +1,91 @@
-"""In-memory registry that tracks all monitored cron jobs."""
+"""Job registry — tracks registered CronJob instances and their check-in state."""
 
-from datetime import datetime
-from typing import Dict, Iterator, List
+from __future__ import annotations
 
-from .schedule import CronJob
+import logging
+import threading
+from datetime import datetime, timezone
+from typing import Callable, Iterator
+
+from croncheck.schedule import CronJob
+
+logger = logging.getLogger(__name__)
 
 
 class JobRegistry:
-    """Central store for :class:`CronJob` instances."""
+    """Thread-safe registry of CronJob instances."""
 
     def __init__(self) -> None:
-        self._jobs: Dict[str, CronJob] = {}
+        self._jobs: dict[str, CronJob] = {}
+        self._lock = threading.Lock()
+        self._listeners: list[Callable[[str, CronJob], None]] = []
 
     # ------------------------------------------------------------------
-    # Mutation helpers
+    # Registration
     # ------------------------------------------------------------------
 
     def register(self, job: CronJob) -> None:
-        """Add or replace a job in the registry."""
-        self._jobs[job.name] = job
+        """Add a job to the registry, replacing any existing entry with the same name."""
+        with self._lock:
+            self._jobs[job.name] = job
+        logger.debug("Registered job '%s'", job.name)
 
     def unregister(self, name: str) -> None:
         """Remove a job by name; silently ignores unknown names."""
-        self._jobs.pop(name, None)
-
-    def checkin(self, name: str, at: datetime | None = None) -> None:
-        """Record a successful execution for *name*.
-
-        Raises
-        ------
-        KeyError
-            If *name* is not registered.
-        """
-        job = self._jobs[name]  # intentional KeyError on unknown job
-        job.last_seen = at or datetime.utcnow()
+        with self._lock:
+            removed = self._jobs.pop(name, None)
+        if removed:
+            logger.debug("Unregistered job '%s'", name)
 
     # ------------------------------------------------------------------
-    # Query helpers
+    # Check-in
     # ------------------------------------------------------------------
 
-    def get(self, name: str) -> CronJob:
-        return self._jobs[name]
+    def checkin(self, name: str, *, success: bool = True) -> None:
+        """Record a check-in for *name*, updating last_checkin timestamp."""
+        with self._lock:
+            job = self._jobs.get(name)
+        if job is None:
+            logger.warning("Check-in for unknown job '%s' ignored", name)
+            return
+        job.last_checkin = datetime.now(tz=timezone.utc)
+        job.last_success = success
+        logger.debug("Check-in recorded for '%s' (success=%s)", name, success)
+        for listener in self._listeners:
+            try:
+                listener(name, job)
+            except Exception:  # noqa: BLE001
+                logger.exception("Listener raised an exception during check-in for '%s'", name)
 
-    def all_jobs(self) -> Iterator[CronJob]:
-        """Iterate over every registered job."""
-        yield from self._jobs.values()
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
 
-    def overdue_jobs(self, reference: datetime | None = None) -> List[CronJob]:
-        """Return jobs that are currently overdue."""
-        ref = reference or datetime.utcnow()
-        return [j for j in self._jobs.values() if j.is_overdue(ref)]
+    def get(self, name: str) -> CronJob | None:
+        """Return the job with *name*, or *None* if not found."""
+        with self._lock:
+            return self._jobs.get(name)
+
+    def all_jobs(self) -> list[CronJob]:
+        """Return a snapshot list of all registered jobs."""
+        with self._lock:
+            return list(self._jobs.values())
+
+    def overdue_jobs(self) -> list[CronJob]:
+        """Return all jobs currently considered overdue."""
+        return [job for job in self.all_jobs() if job.is_overdue()]
+
+    def __iter__(self) -> Iterator[CronJob]:
+        return iter(self.all_jobs())
 
     def __len__(self) -> int:
-        return len(self._jobs)
+        with self._lock:
+            return len(self._jobs)
 
-    def __contains__(self, name: str) -> bool:
-        return name in self._jobs
+    # ------------------------------------------------------------------
+    # Listeners
+    # ------------------------------------------------------------------
+
+    def add_checkin_listener(self, fn: Callable[[str, CronJob], None]) -> None:
+        """Register a callback invoked after every successful check-in."""
+        self._listeners.append(fn)
